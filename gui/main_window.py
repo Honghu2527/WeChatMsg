@@ -135,8 +135,8 @@ class MainWindow(ttk.Frame):
             self.status.set(f"Detected {len(accounts)} WeChat account(s). Choose Prepare database.")
         else:
             self.status.set(
-                f"Detected {len(accounts)} account(s), but the selected account has no database key. "
-                "Open Detection details for version/PID/path diagnostics."
+                f"Detected {len(accounts)} account(s). Legacy key was not found; Prepare database will use the "
+                "WeChat 4.1.13+ per-database Config.Cipher scan."
             )
 
     def update_account_details(self):
@@ -145,10 +145,13 @@ class MainWindow(ttk.Frame):
             self.account_details.set("No account selected.")
             return
         account = self.accounts[index]
-        key_text = "FOUND" if account.key_found else "NOT FOUND"
+        if account.key_found:
+            key_text = "FOUND (legacy master-key mode)"
+        else:
+            key_text = "NOT FOUND — Config.Cipher fallback will run on Prepare"
         self.account_details.set(
             f"Version: {account.version or 'unknown'} | PID: {account.pid or 'unknown'} | "
-            f"Database key: {key_text}\nData folder: {account.source_dir or 'not detected'}"
+            f"Legacy key: {key_text}\nData folder: {account.source_dir or 'not detected'}"
         )
 
     def show_detection_details(self):
@@ -179,15 +182,10 @@ class MainWindow(ttk.Frame):
             self.fail(services.GuiServiceError("No WeChat 4.x account is selected. Run detection first."))
             return
         account = self.accounts[index]
-        if not account.key_found:
-            self.fail(
-                services.GuiServiceError(
-                    "The account/data folder was detected, but the database key was not found. "
-                    "Open Detection details and keep that information for troubleshooting."
-                )
-            )
-            return
-        self.busy("Preparing the database…")
+        if account.key_found:
+            self.busy("Preparing the database…")
+        else:
+            self.busy("Scanning WeChat 4.1.13+ per-database keys and preparing the database…")
         callback = lambda value, text: self.tasks.post(self.progress_update, value, text)
         self.tasks.submit(lambda: services.prepare_database(account, self.workspace.get(), callback), self._prepared, self.fail)
 
