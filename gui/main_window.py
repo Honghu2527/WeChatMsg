@@ -109,10 +109,25 @@ class MainWindow(ttk.Frame):
     def idle(self):
         self.export_button.configure(state="normal")
 
+    @staticmethod
+    def _format_error(error):
+        lines = [str(error)]
+        seen = set()
+        cause = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            detail = str(cause).strip() or repr(cause)
+            lines.append(f"{type(cause).__name__}: {detail}")
+            cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+        if len(lines) == 1:
+            return lines[0]
+        return lines[0] + "\n\nTechnical details:\n" + "\n".join(lines[1:])
+
     def fail(self, error):
         self.idle()
-        self.status.set(str(error))
-        messagebox.showerror("WeChatMsg", str(error))
+        text = self._format_error(error)
+        self.status.set(text.replace("\n", " | "))
+        messagebox.showerror("WeChatMsg", text)
 
     def progress_update(self, value, text):
         self.progress["value"] = value * 100
