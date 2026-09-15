@@ -51,6 +51,12 @@ class ServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(services.GuiServiceError, "info.json"):
                 services.use_prepared_database(directory)
 
+    @staticmethod
+    def _make_minimal_prepared_tree(dest_dir):
+        contact = Path(dest_dir, "db_storage", "contact")
+        contact.mkdir(parents=True, exist_ok=True)
+        Path(contact, "contact.db").write_bytes(b"test")
+
     def test_prepare_database_uses_separate_destination_and_does_not_store_key(self):
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as workspace:
             account = services.AccountInfo("wxid_test", "Alice", source, "secret")
@@ -58,7 +64,7 @@ class ServiceTests(unittest.TestCase):
 
             def decryptor(key, src_dir, dest_dir):
                 calls.append((key, src_dir, dest_dir))
-                Path(dest_dir, "db_storage").mkdir(parents=True)
+                self._make_minimal_prepared_tree(dest_dir)
 
             prepared = services.prepare_database(account, workspace, decryptor=decryptor, xor_key_provider=lambda _: 123)
             self.assertNotEqual(Path(prepared.db_dir), Path(source))
@@ -66,6 +72,39 @@ class ServiceTests(unittest.TestCase):
             info = Path(prepared.db_dir, "info.json").read_text(encoding="utf-8")
             self.assertNotIn("secret", info)
             self.assertIn('"username": "wxid_test"', info)
+
+    def test_prepare_database_uses_per_db_keys_when_legacy_key_missing(self):
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as workspace:
+            Path(source, "db_storage").mkdir()
+            account = services.AccountInfo(
+                "wxid_test", "Alice", source, "", version="4.1.13.65", pid=27200
+            )
+            raw_key = b"k" * 32
+            key_map = {"db_storage/contact/contact.db": raw_key}
+            provider_calls = []
+            decrypt_calls = []
+
+            def provider(pid, src_dir, progress):
+                provider_calls.append((pid, src_dir))
+                return key_map
+
+            def decryptor(keys, src_dir, dest_dir):
+                decrypt_calls.append((keys, src_dir, dest_dir))
+                self._make_minimal_prepared_tree(dest_dir)
+                return {"decrypted": 1, "plaintext_copied": 0, "unmatched": []}
+
+            prepared = services.prepare_database(
+                account,
+                workspace,
+                decryptor=decryptor,
+                xor_key_provider=lambda _: 123,
+                per_db_key_provider=provider,
+            )
+            self.assertEqual(provider_calls, [(27200, source)])
+            self.assertIs(decrypt_calls[0][0], key_map)
+            info = Path(prepared.db_dir, "info.json").read_text(encoding="utf-8")
+            self.assertNotIn(raw_key.hex(), info)
+            self.assertNotIn("database key", info.lower())
 
     def test_prepare_database_rejects_destination_inside_source(self):
         with tempfile.TemporaryDirectory() as source:
