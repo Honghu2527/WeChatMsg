@@ -1,0 +1,77 @@
+name: Build Windows GUI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - v4-new-arch
+      - "codex/**"
+      - gui
+      - "gui/**"
+    paths:
+      - "gui/**"
+      - "wxManager/**"
+      - "exporter/**"
+      - "tests/**"
+      - "requirements.txt"
+      - "WeChatExporter.spec"
+      - ".github/workflows/build-windows-gui.yml"
+  pull_request:
+    branches:
+      - v4-new-arch
+    paths:
+      - "gui/**"
+      - "wxManager/**"
+      - "exporter/**"
+      - "tests/**"
+      - "requirements.txt"
+      - "WeChatExporter.spec"
+      - ".github/workflows/build-windows-gui.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-gui:
+    name: Build WeChatExporter.exe
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project and build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller>=6.10,<7"
+
+      - name: Run GUI service tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build windowed executable
+        run: python -m PyInstaller --noconfirm --clean WeChatExporter.spec
+
+      - name: Verify packaged executable
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/WeChatExporter.exe" -PathType Leaf)) {
+            throw "dist/WeChatExporter.exe was not created"
+          }
+          Get-Item "dist/WeChatExporter.exe" | Format-List Name, Length, LastWriteTime
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeChatExporter-windows
+          path: dist/WeChatExporter.exe
+          if-no-files-found: error
+          retention-days: 14

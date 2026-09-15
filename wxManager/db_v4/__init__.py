@@ -13,7 +13,7 @@ from .message import MessageDB
 from .contact import ContactDB
 from .session import SessionDB
 from .head_image import HeadImageDB
-from .hardlink import HardLinkDB
+from .hardlink_compat import HardLinkDB
 
 if __name__ == '__main__':
     pass
