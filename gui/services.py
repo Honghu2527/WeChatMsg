@@ -23,16 +23,53 @@ class AccountInfo:
     nickname: str
     source_dir: str
     key: str
+    version: str = ""
+    pid: int = 0
+    errcode: int = 0
 
     @property
     def display_name(self) -> str:
-        return f"{self.nickname or self.wxid} ({self.wxid})"
+        suffix = f" — WeChat {self.version}" if self.version else ""
+        return f"{self.nickname or self.wxid} ({self.wxid}){suffix}"
+
+    @property
+    def key_found(self) -> bool:
+        return bool(self.key)
+
+    @property
+    def diagnostic_summary(self) -> str:
+        return "\n".join(
+            (
+                f"Internal wxid: {self.wxid or 'unknown'}",
+                f"Nickname: {self.nickname or 'not detected'}",
+                f"WeChat version: {self.version or 'unknown'}",
+                f"PID: {self.pid or 'unknown'}",
+                f"Data folder: {self.source_dir or 'not detected'}",
+                f"Database key: {'FOUND' if self.key_found else 'NOT FOUND'}",
+            )
+        )
 
 
 @dataclass(frozen=True)
 class PreparedDatabase:
     db_dir: str
     wxid: str = ""
+
+
+def _adapt_accounts(detected) -> list[AccountInfo]:
+    return [
+        AccountInfo(
+            wxid=getattr(item, "wxid", "") or "",
+            nickname=getattr(item, "nick_name", "") or "",
+            source_dir=getattr(item, "wx_dir", "") or "",
+            key=getattr(item, "key", "") or "",
+            version=str(getattr(item, "version", "") or ""),
+            pid=int(getattr(item, "pid", 0) or 0),
+            errcode=int(getattr(item, "errcode", 0) or 0),
+        )
+        for item in detected
+        if item is not None
+    ]
 
 
 def detect_accounts(info_provider=None) -> list[AccountInfo]:
@@ -50,21 +87,37 @@ def detect_accounts(info_provider=None) -> list[AccountInfo]:
         detected = info_provider()
     except Exception as exc:
         raise GuiServiceError(
-            "WeChat account detection failed. Make sure WeChat 4.x is running, then try again."
+            "WeChat account detection failed before a usable account could be returned."
         ) from exc
     if not detected:
         raise GuiServiceError("No WeChat 4.x account was detected. Please start and sign in to WeChat first.")
 
-    accounts = [
-        AccountInfo(
-            wxid=getattr(item, "wxid", "") or "",
-            nickname=getattr(item, "nick_name", "") or "",
-            source_dir=getattr(item, "wx_dir", "") or "",
-            key=getattr(item, "key", "") or "",
+    return _adapt_accounts(detected)
+
+
+def detect_accounts_detailed() -> tuple[list[AccountInfo], list[str]]:
+    """Detect accounts and return copyable, key-safe process diagnostics for the GUI."""
+    try:
+        from wxManager.decrypt import get_info_v4_diagnostics
+    except Exception as exc:
+        raise GuiServiceError(
+            "WeChat 4.x detection is available only on Windows with the project dependencies installed."
+        ) from exc
+
+    try:
+        detected, diagnostics = get_info_v4_diagnostics()
+    except Exception as exc:
+        raise GuiServiceError(
+            f"WeChat account detection failed unexpectedly ({type(exc).__name__})."
+        ) from exc
+
+    accounts = _adapt_accounts(detected)
+    if not accounts:
+        details = "\n".join(diagnostics[-12:]) if diagnostics else "No process diagnostics were produced."
+        raise GuiServiceError(
+            "No usable WeChat 4.x account was detected.\n\nDetection details:\n" + details
         )
-        for item in detected
-    ]
-    return accounts
+    return accounts, diagnostics
 
 
 def prepare_database(
@@ -76,7 +129,11 @@ def prepare_database(
 ) -> PreparedDatabase:
     """Decrypt into a new workspace; the original database is never opened for writing."""
     if not account.key:
-        raise GuiServiceError("No database key was found. Restart WeChat and try detection again.")
+        version = account.version or "unknown"
+        raise GuiServiceError(
+            "Account and data-folder detection succeeded, but no database key was found. "
+            f"Detected WeChat version: {version}. Open Detection details for the PID/path information."
+        )
     if not account.source_dir or not Path(account.source_dir).is_dir():
         raise GuiServiceError("The detected WeChat database directory no longer exists.")
     if not workspace:
