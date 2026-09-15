@@ -38,6 +38,8 @@ class AccountInfo:
 
     @property
     def diagnostic_summary(self) -> str:
+        key_status = "FOUND" if self.key_found else "NOT FOUND"
+        fallback = "" if self.key_found else " (per-database Config.Cipher fallback available on Prepare)"
         return "\n".join(
             (
                 f"Internal wxid: {self.wxid or 'unknown'}",
@@ -45,7 +47,7 @@ class AccountInfo:
                 f"WeChat version: {self.version or 'unknown'}",
                 f"PID: {self.pid or 'unknown'}",
                 f"Data folder: {self.source_dir or 'not detected'}",
-                f"Database key: {'FOUND' if self.key_found else 'NOT FOUND'}",
+                f"Legacy database key: {key_status}{fallback}",
             )
         )
 
@@ -126,14 +128,15 @@ def prepare_database(
     progress: ProgressCallback | None = None,
     decryptor=None,
     xor_key_provider=None,
+    per_db_key_provider=None,
 ) -> PreparedDatabase:
-    """Decrypt into a new workspace; the original database is never opened for writing."""
-    if not account.key:
-        version = account.version or "unknown"
-        raise GuiServiceError(
-            "Account and data-folder detection succeeded, but no database key was found. "
-            f"Detected WeChat version: {version}. Open Detection details for the PID/path information."
-        )
+    """Decrypt into a new workspace; the original database is never opened for writing.
+
+    Older WeChat 4.x builds use the legacy master-key path.  When that key is not
+    available (notably 4.1.13+), a read-only Config.Cipher scan obtains and
+    validates per-database raw keys in memory.  Key material is never saved to
+    ``info.json`` or anywhere else by this service.
+    """
     if not account.source_dir or not Path(account.source_dir).is_dir():
         raise GuiServiceError("The detected WeChat database directory no longer exists.")
     if not workspace:
@@ -144,8 +147,6 @@ def prepare_database(
     source_root = Path(account.source_dir).resolve()
     if destination_root == source_root or source_root in destination_root.parents:
         raise GuiServiceError("Choose a working directory outside the original WeChat data directory.")
-    if progress:
-        progress(0.05, "Preparing a read-only copy of the WeChat database…")
 
     if decryptor is None:
         from wxManager.decrypt.decrypt_v4 import decrypt_db_files
@@ -154,12 +155,46 @@ def prepare_database(
         from wxManager.decrypt.decrypt_dat import get_decode_code_v4
         xor_key_provider = get_decode_code_v4
 
+    key_material = account.key
+    key_mode = "legacy master key"
+    if not key_material:
+        if not account.pid:
+            raise GuiServiceError(
+                "The account was detected but its Weixin.exe PID is unavailable, so the 4.1.13+ key scan cannot run."
+            )
+        if per_db_key_provider is None:
+            from wxManager.decrypt.keyscan_v413 import scan_and_match_keys
+            per_db_key_provider = scan_and_match_keys
+        if progress:
+            progress(0.05, "Legacy key unavailable; using the WeChat 4.1.13+ Config.Cipher key scan…")
+        try:
+            key_material = per_db_key_provider(account.pid, account.source_dir, progress)
+        except Exception as exc:
+            raise GuiServiceError(
+                "The WeChat 4.1.13+ per-database key scan failed. Keep WeChat logged in and try running this app as administrator."
+            ) from exc
+        if not key_material:
+            raise GuiServiceError(
+                "The account and data folder were detected, but no valid per-database keys could be matched. "
+                "This WeChat build may use a newer Config.Cipher layout."
+            )
+        key_mode = f"per-database Config.Cipher keys ({len(key_material)} matched)"
+
+    if progress:
+        progress(0.66 if not account.key else 0.05, f"Preparing a read-only database copy using {key_mode}…")
+
     destination_root.mkdir(parents=True, exist_ok=True)
     try:
         xor_key = xor_key_provider(account.source_dir)
-        decryptor(account.key, src_dir=account.source_dir, dest_dir=str(destination_root))
+        stats = decryptor(key_material, src_dir=account.source_dir, dest_dir=str(destination_root))
         if not db_dir.is_dir():
             raise RuntimeError("The expected db_storage directory was not created")
+
+        # These are the minimum pieces needed to show contacts and conversations.
+        required = [db_dir / "contact" / "contact.db"]
+        if not all(path.is_file() for path in required):
+            raise RuntimeError("The contact database could not be prepared")
+
         info = {
             "username": account.wxid,
             "nickname": account.nickname,
@@ -168,11 +203,21 @@ def prepare_database(
         }
         with (db_dir / "info.json").open("w", encoding="utf-8") as stream:
             json.dump(info, stream, ensure_ascii=False, indent=4)
+    except GuiServiceError:
+        raise
     except Exception as exc:
-        raise GuiServiceError("Database preparation failed. Check the working directory and try again.") from exc
+        raise GuiServiceError(
+            "Database preparation failed after key discovery. The original WeChat data was not changed."
+        ) from exc
 
     if progress:
-        progress(1.0, "Database is ready.")
+        if isinstance(stats, dict) and stats.get("unmatched"):
+            progress(
+                1.0,
+                f"Database prepared; {len(stats['unmatched'])} nonessential encrypted DB(s) had no matched key.",
+            )
+        else:
+            progress(1.0, "Database is ready.")
     return PreparedDatabase(str(db_dir), account.wxid)
 
 
