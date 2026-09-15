@@ -1,13 +1,13 @@
 """Read-only per-database key discovery for recent WeChat 4.1.x builds.
 
 WeChat 4.1.13+ no longer reliably exposes the single legacy master key used by
-this project.  Recent WCDB builds keep per-database raw SQLCipher keys in
-``com.Tencent.WCDB.Config.Cipher`` objects inside Weixin.exe.  This module scans
+this project. Recent WCDB builds keep per-database raw SQLCipher keys in
+``com.Tencent.WCDB.Config.Cipher`` objects inside Weixin.exe. This module scans
 that process memory read-only, validates candidates against local database page
 1 HMACs, and returns keys only in memory.
 
 The Config.Cipher layout/decoding strategy is independently adapted from the
-Apache-2.0 project ``fanyuantaier/wechatauto-replica``.  No key material is
+Apache-2.0 project ``fanyuantaier/wechatauto-replica``. No key material is
 logged or persisted by this module.
 """
 
@@ -25,6 +25,7 @@ from typing import Callable
 
 PAGE_SIZE = 4096
 RESERVE_SIZE = 80  # IV(16) + HMAC-SHA512(64)
+SQLITE_HEADER = b"SQLite format 3\x00"
 CONFIG_CIPHER_NAME = b"com.Tencent.WCDB.Config.Cipher"
 CONFIG_XOR_MASK = bytes.fromhex(
     "d2c7442458020000004889442450488b"
@@ -41,8 +42,6 @@ ProgressCallback = Callable[[float, str], None]
 
 
 class _MBI(ctypes.Structure):
-    # Windows x64 MEMORY_BASIC_INFORMATION layout.  The explicit alignment
-    # DWORDs keep RegionSize at the correct offset when Python is 64-bit.
     _fields_ = [
         ("BaseAddress", ctypes.c_void_p),
         ("AllocationBase", ctypes.c_void_p),
@@ -140,8 +139,6 @@ def _find_bytes(kernel32, handle, read, needle: bytes) -> list[int]:
         base = int(mbi.BaseAddress or 0)
         region_size = int(mbi.RegionSize or 0)
         protection = int(mbi.Protect or 0)
-        # The 0xE6 mask covers the normal readable PAGE_* protection flags used
-        # by Weixin.exe; PAGE_GUARD regions are intentionally skipped.
         if (
             mbi.State == MEM_COMMIT
             and (protection & 0xFF) & 0xE6
@@ -253,6 +250,19 @@ def _database_files(account_dir: str) -> list[tuple[str, Path]]:
 def _match_candidates(
     candidates: set[tuple[bytes, bytes | None]], db_files: list[tuple[str, Path]]
 ) -> dict[str, bytes]:
+    """Match key candidates deterministically and avoid false plaintext-header mode.
+
+    A 96-hex Config.Cipher literal can yield both a normal 32-byte key candidate
+    and a 32-byte key + 16-byte explicit-salt candidate.  The previous code
+    iterated a set, so an explicit-salt candidate could win nondeterministically
+    even for a normal encrypted database.  That decrypts to a file whose first
+    16 bytes are still the encrypted salt and sqlite3 then reports
+    ``DatabaseError: file is not a database``.
+
+    Standard SQLCipher databases are therefore matched with the bare key first.
+    Explicit-salt mode is only considered when page 1 already has a plaintext
+    SQLite header, which is the WCDB plaintext-header layout it is meant for.
+    """
     matched: dict[str, bytes] = {}
     pages: dict[str, bytes] = {}
     for relative, path in db_files:
@@ -262,13 +272,27 @@ def _match_candidates(
         except OSError:
             continue
 
-    for key, explicit_salt in candidates:
-        for relative, page1 in pages.items():
-            if relative in matched:
-                continue
-            if verify_raw_key(key, page1, explicit_salt):
-                matched[relative] = key + (explicit_salt or b"")
+    bare_keys = sorted({key for key, salt in candidates if salt is None})
+    explicit = sorted({(key, salt) for key, salt in candidates if salt is not None})
+
+    # Phase 1: normal SQLCipher layout.  This is the common WeChat 4.1.x case.
+    for relative, page1 in pages.items():
+        for key in bare_keys:
+            if verify_raw_key(key, page1, None):
+                matched[relative] = key
                 break
+
+    # Phase 2: plaintext-header mode only.  Never use an explicit salt on a
+    # standard encrypted page, otherwise the output keeps a random 16-byte salt
+    # where SQLite expects its file signature.
+    for relative, page1 in pages.items():
+        if relative in matched or page1[:16] != SQLITE_HEADER:
+            continue
+        for key, explicit_salt in explicit:
+            if verify_raw_key(key, page1, explicit_salt):
+                matched[relative] = key + explicit_salt
+                break
+
     return matched
 
 
@@ -297,8 +321,8 @@ def scan_and_match_keys(
 ) -> dict[str, bytes]:
     """Return an in-memory map ``relative_db_path -> raw key bytes``.
 
-    The detected main PID is tried first.  If it yields no usable keys, other
-    Weixin.exe processes are scanned as a fallback.  Nothing is written to the
+    The detected main PID is tried first. If it yields no usable keys, other
+    Weixin.exe processes are scanned as a fallback. Nothing is written to the
     WeChat directory and the returned key map is never persisted by this module.
     """
     db_files = _database_files(account_dir)
@@ -325,9 +349,6 @@ def scan_and_match_keys(
             continue
         matched = _match_candidates(all_candidates, db_files)
         if matched:
-            # One main process normally contains the complete active-account key set.
-            # Keep scanning only when very few DBs matched, because recent WeChat can
-            # split state across processes.
             if len(matched) >= max(3, len(db_files) // 3):
                 break
 
